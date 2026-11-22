@@ -13,15 +13,16 @@ import traceback
 from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
-from typing import Iterable
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
 import torch
 
 from bm3d_tensor.config import BM3DConfig, RuntimeConfig
+from bm3d_tensor.dual_radial_oracle import BM3DDualRadialOracle
 from bm3d_tensor.matching import MatchResult
-from bm3d_tensor.oracle import BM3DMultiplierOracle, OracleMode
+from bm3d_tensor.oracle import BM3DMultiplierOracle
 from bm3d_tensor.precomputed import BM3DWienerPrecomputed
 
 
@@ -54,10 +55,10 @@ def parse_args() -> argparse.Namespace:
 
     noise = parser.add_argument_group("noise realizations")
     noise.add_argument("--sigma", type=float, default=20.0, help="Gaussian noise std in 0-255 units.")
-    noise.add_argument("--train-realizations", type=int, default=16)
+    noise.add_argument("--train-realizations", type=int, default=8)
     noise.add_argument("--validation-realizations", type=int, default=4)
     noise.add_argument("--train-seed-start", type=int, default=0)
-    noise.add_argument("--validation-seed-start", type=int, default=1_000_000)
+    noise.add_argument("--validation-seed-start", type=int, default=1_000)
     noise.add_argument(
         "--image-seed-stride",
         type=int,
@@ -74,13 +75,39 @@ def parse_args() -> argparse.Namespace:
     optimization = parser.add_argument_group("optimization")
     optimization.add_argument(
         "--mode",
-        choices=("per_coefficient", "per_radial_row", "per_square_shell", "per_group"),
-        default="per_coefficient",
-        help="Multiplier parameterization; per_coefficient is largest and most expressive.",
+        choices=(
+            "dual_radial",
+            "per_coefficient",
+            "per_radial_row",
+            "per_square_shell",
+            "per_group",
+        ),
+        default="dual_radial",
+        help=(
+            "Multiplier parameterization; dual_radial learns 8 H0 plus 8 shared "
+            "H1+ radial values at every reference location."
+        ),
     )
-    optimization.add_argument("--epochs", type=int, default=10)
-    optimization.add_argument("--batch-size", type=int, default=4, help="Gradient accumulation seeds per update.")
-    optimization.add_argument("--learning-rate", type=float, default=500_000.0)
+    optimization.add_argument("--epochs", type=int, default=12)
+    optimization.add_argument("--batch-size", type=int, default=2, help="Gradient accumulation seeds per update.")
+    optimization.add_argument(
+        "--optimizer",
+        choices=("auto", "adam", "sgd"),
+        default="auto",
+        help="Auto selects Adam for dual_radial and SGD for legacy modes.",
+    )
+    optimization.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Auto default: 0.2 for dual_radial, 500000 for legacy modes.",
+    )
+    optimization.add_argument(
+        "--validation-every",
+        type=int,
+        default=2,
+        help="Evaluate held-out seeds and update the best checkpoint every N epochs.",
+    )
     optimization.add_argument("--multiplier-min", type=float, default=1e-4)
     optimization.add_argument("--multiplier-max", type=float, default=10.0)
     optimization.add_argument("--initial-multiplier", type=float, default=1.0)
@@ -115,6 +142,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_optimization_defaults(args: argparse.Namespace) -> None:
+    """Resolve mode-dependent optimizer settings before validation/recording."""
+    if args.optimizer == "auto":
+        args.optimizer = "adam" if args.mode == "dual_radial" else "sgd"
+    if args.learning_rate is None:
+        args.learning_rate = 0.2 if args.mode == "dual_radial" else 500_000.0
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if not args.input_dir.is_dir():
         raise NotADirectoryError(args.input_dir)
@@ -122,8 +157,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sigma must be finite and positive")
     if args.train_realizations <= 0 or args.validation_realizations < 0:
         raise ValueError("training realizations must be positive and validation realizations nonnegative")
-    if args.epochs <= 0 or args.batch_size <= 0:
-        raise ValueError("--epochs and --batch-size must be positive")
+    if args.epochs <= 0 or args.batch_size <= 0 or args.validation_every <= 0:
+        raise ValueError("--epochs, --batch-size, and --validation-every must be positive")
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("--learning-rate must be finite and positive")
     bounds = (args.multiplier_min, args.initial_multiplier, args.multiplier_max)
@@ -315,7 +350,7 @@ def checkpoint_payload(
     return {
         "format_version": 1,
         "completed_epoch": completed_epoch,
-        "mode": oracle.mode,
+        "mode": metadata["mode"],
         "model": {name: value.detach().cpu() for name, value in oracle.state_dict().items()},
         "optimizer": optimizer.state_dict(),
         "metadata": metadata,
@@ -353,8 +388,11 @@ def load_checkpoint(
         "initial_multiplier",
         "clip_noisy",
         "train_seeds",
+        "validation_seeds",
         "batch_size",
+        "optimizer",
         "learning_rate",
+        "validation_every",
         "config",
     ):
         if actual.get(key) != expected_metadata.get(key):
@@ -374,6 +412,103 @@ def mean_metrics(rows: list[dict[str, object]], prefix: str) -> dict[str, float]
     }
 
 
+def create_oracle(
+    prepared: BM3DWienerPrecomputed,
+    args: argparse.Namespace,
+) -> BM3DMultiplierOracle:
+    common = {
+        "multiplier_min": args.multiplier_min,
+        "multiplier_max": args.multiplier_max,
+        "initial_multiplier": args.initial_multiplier,
+        "checkpoint_chunks": args.activation_checkpointing,
+    }
+    if args.mode == "dual_radial":
+        return BM3DDualRadialOracle(prepared, **common)
+    return BM3DMultiplierOracle(prepared, mode=args.mode, **common)
+
+
+def create_optimizer(
+    oracle: BM3DMultiplierOracle,
+    args: argparse.Namespace,
+) -> torch.optim.Optimizer:
+    if args.optimizer == "adam":
+        return torch.optim.Adam(
+            oracle.parameters(),
+            lr=args.learning_rate,
+            foreach=False,
+        )
+    if args.optimizer == "sgd":
+        return torch.optim.SGD(
+            oracle.parameters(),
+            lr=args.learning_rate,
+            momentum=0,
+            foreach=False,
+        )
+    raise ValueError(f"unsupported optimizer: {args.optimizer}")
+
+
+def profile_statistics(
+    log_profiles: np.ndarray,
+    multiplier_min: float,
+    multiplier_max: float,
+) -> dict[str, object]:
+    """Summarize a ``[B,R,2,8]`` dual-radial log-multiplier map."""
+    if log_profiles.ndim != 4 or log_profiles.shape[-2:] != (2, 8):
+        raise ValueError(
+            "dual-radial profiles must have [B,R,2,8] shape; "
+            f"got {log_profiles.shape}"
+        )
+    multipliers = np.exp(log_profiles.astype(np.float64))
+    result: dict[str, object] = {}
+    for index, name in enumerate(("h0", "h1_plus")):
+        values = multipliers[..., index, :]
+        logs = log_profiles[..., index, :].astype(np.float64)
+        second = logs[..., 2:] - 2 * logs[..., 1:-1] + logs[..., :-2]
+        result[name] = {
+            "arithmetic_mean": float(values.mean()),
+            "geometric_mean": float(np.exp(logs.mean())),
+            "std": float(values.std()),
+            "minimum": float(values.min()),
+            "maximum": float(values.max()),
+            "fraction_below_1": float(np.mean(values < 1.0)),
+            "fraction_above_1": float(np.mean(values > 1.0)),
+            "fraction_at_floor": float(
+                np.mean(values <= multiplier_min * (1 + 1e-6))
+            ),
+            "fraction_at_ceiling": float(
+                np.mean(values >= multiplier_max * (1 - 1e-6))
+            ),
+            "log_second_difference_rms": float(
+                np.sqrt(np.mean(np.square(second)))
+            ),
+            "mean_vector": values.mean(axis=(0, 1)).tolist(),
+            "median_vector": np.median(values, axis=(0, 1)).tolist(),
+        }
+    return result
+
+
+def save_best_checkpoint(
+    path: Path,
+    oracle: BM3DMultiplierOracle,
+    epoch: int,
+    metrics: dict[str, float],
+) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(
+        {
+            "format_version": 1,
+            "selected_epoch": epoch,
+            "metrics": metrics,
+            "model": {
+                name: value.detach().cpu().clone()
+                for name, value in oracle.state_dict().items()
+            },
+        },
+        temporary,
+    )
+    temporary.replace(path)
+
+
 def train(
     oracle: BM3DMultiplierOracle,
     optimizer: torch.optim.Optimizer,
@@ -387,6 +522,7 @@ def train(
     image_dir: Path,
     checkpoint_metadata: dict[str, object],
     start_epoch: int,
+    on_epoch_end: Callable[[int], None] | None = None,
 ) -> list[dict[str, object]]:
     history_path = image_dir / "optimization_history.csv"
     history: list[dict[str, object]] = []
@@ -397,7 +533,10 @@ def train(
     run_start = perf_counter()
 
     for epoch in range(start_epoch, args.epochs):
-        order = np.random.default_rng(90_000 + epoch).permutation(train_seeds).tolist()
+        completed_epoch = epoch + 1
+        order = np.random.default_rng(
+            90_000 + completed_epoch
+        ).permutation(train_seeds).tolist()
         for batch_start in range(0, len(order), args.batch_size):
             batch = order[batch_start : batch_start + args.batch_size]
             optimizer.zero_grad(set_to_none=True)
@@ -460,7 +599,6 @@ def train(
                 flush=True,
             )
 
-        completed_epoch = epoch + 1
         if args.checkpoint_every and completed_epoch % args.checkpoint_every == 0:
             save_checkpoint(
                 image_dir / "restart_checkpoint.pt",
@@ -469,6 +607,8 @@ def train(
                 completed_epoch,
                 checkpoint_metadata,
             )
+        if on_epoch_end is not None:
+            on_epoch_end(completed_epoch)
     return history
 
 
@@ -482,6 +622,10 @@ def evaluate(
     args: argparse.Namespace,
     device: torch.device,
     image_dir: Path,
+    *,
+    include_fixed: bool = True,
+    metrics_filename: str = "validation_metrics.csv",
+    save_previews: bool = False,
 ) -> tuple[list[dict[str, object]], dict[str, float], dict[str, float]]:
     rows: list[dict[str, object]] = []
     oracle.eval()
@@ -497,34 +641,39 @@ def evaluate(
             device,
         )
         oracle.use_prepared_(prepared)
-        fixed = tensor_to_numpy(prepared.run(1.0))
         learned = tensor_to_numpy(oracle())
-        fixed_metrics = image_metrics(clean, fixed)
         learned_metrics = image_metrics(clean, learned)
-        rows.append(
-            {
-                "seed": seed,
-                "preparation_seconds": elapsed,
-                **{f"fixed_{key}": value for key, value in fixed_metrics.items()},
-                **{f"learned_{key}": value for key, value in learned_metrics.items()},
-            }
-        )
-        if index == 1:
+        row: dict[str, object] = {
+            "seed": seed,
+            "preparation_seconds": elapsed,
+            **{f"learned_{key}": value for key, value in learned_metrics.items()},
+        }
+        fixed: np.ndarray | None = None
+        if include_fixed:
+            fixed = tensor_to_numpy(prepared.run(1.0))
+            fixed_metrics = image_metrics(clean, fixed)
+            row.update(
+                {f"fixed_{key}": value for key, value in fixed_metrics.items()}
+            )
+        rows.append(row)
+        if index == 1 and save_previews:
             images = {
                 "clean.png": clean,
                 "noisy.png": noisy_realization(clean, args.sigma, seed, args.clip_noisy),
-                "fixed_x1.png": fixed,
                 "learned.png": learned,
             }
+            if fixed is not None:
+                images["fixed_x1.png"] = fixed
             for filename, image in images.items():
                 ok = cv2.imwrite(str(image_dir / filename), np.rint(np.clip(image, 0, 255)).astype(np.uint8))
                 if not ok:
                     raise OSError(f"failed to write {image_dir / filename}")
         release_preparation(prepared, device)
-    write_csv(image_dir / "validation_metrics.csv", rows)
+    write_csv(image_dir / metrics_filename, rows)
     if not rows:
         return rows, {}, {}
-    return rows, mean_metrics(rows, "fixed"), mean_metrics(rows, "learned")
+    fixed_mean = mean_metrics(rows, "fixed") if include_fixed else {}
+    return rows, fixed_mean, mean_metrics(rows, "learned")
 
 
 def process_image(
@@ -569,8 +718,11 @@ def process_image(
         "initial_multiplier": args.initial_multiplier,
         "clip_noisy": args.clip_noisy,
         "train_seeds": train_seeds,
+        "validation_seeds": validation_seeds,
         "batch_size": args.batch_size,
+        "optimizer": args.optimizer,
         "learning_rate": args.learning_rate,
+        "validation_every": args.validation_every,
         "config": asdict(config),
     }
 
@@ -590,23 +742,28 @@ def process_image(
     synchronize(device)
     canonical_seconds = perf_counter() - canonical_start
     canonical_matches = canonical.matches
+    reference_count = canonical.reference_count
+    reference_grid_shape = list(canonical.reference_grid_shape)
     group_counts = {
         str(group_size): int(selected.numel())
         for group_size, selected in canonical._selected_by_size.items()
     }
-    oracle = BM3DMultiplierOracle(
-        canonical,
-        mode=args.mode,
-        multiplier_min=args.multiplier_min,
-        multiplier_max=args.multiplier_max,
-        initial_multiplier=args.initial_multiplier,
-        checkpoint_chunks=args.activation_checkpointing,
-    )
+    oracle = create_oracle(canonical, args)
     parameter_count = oracle.parameter_count
+    if args.mode == "dual_radial":
+        expected_parameter_count = 16 * reference_count
+        if parameter_count != expected_parameter_count:
+            raise RuntimeError(
+                "dual_radial must have exactly 16 parameters per reference; "
+                f"got {parameter_count} parameters for {reference_count} "
+                "references"
+            )
     release_preparation(canonical, device)
-    optimizer = torch.optim.SGD(oracle.parameters(), lr=args.learning_rate, momentum=0, foreach=False)
+    optimizer = create_optimizer(oracle, args)
 
     checkpoint_path = image_dir / "restart_checkpoint.pt"
+    best_checkpoint_path = image_dir / "best_checkpoint.pt"
+    validation_history_path = image_dir / "validation_history.csv"
     start_epoch = 0
     if args.resume and checkpoint_path.exists():
         start_epoch = load_checkpoint(checkpoint_path, oracle, optimizer, metadata)
@@ -615,6 +772,136 @@ def process_image(
                 f"checkpoint has {start_epoch} completed epochs but --epochs is {args.epochs}"
             )
         print(f"    resumed after epoch {start_epoch}", flush=True)
+
+    validation_history: list[dict[str, object]] = []
+    if args.resume and validation_history_path.exists():
+        with validation_history_path.open(newline="", encoding="utf-8") as file:
+            for raw in csv.DictReader(file):
+                validation_history.append(
+                    {
+                        "epoch": int(raw["epoch"]),
+                        **{
+                            name: float(raw[name])
+                            for name in METRIC_NAMES
+                        },
+                        "delta_psnr_from_fixed_x1": float(
+                            raw["delta_psnr_from_fixed_x1"]
+                        ),
+                    }
+                )
+
+    fixed_metrics: dict[str, float] = {}
+    initial_metrics: dict[str, float] = {}
+    best_metrics: dict[str, float] = {}
+    best_epoch = start_epoch
+    if validation_seeds:
+        _, fixed_metrics, current_metrics = evaluate(
+            oracle,
+            clean,
+            config,
+            canonical_matches,
+            validation_seeds,
+            args,
+            device,
+            image_dir,
+            include_fixed=True,
+            metrics_filename=(
+                "resume_validation_metrics.csv"
+                if start_epoch
+                else "start_validation_metrics.csv"
+            ),
+            save_previews=True,
+        )
+        current_row = {
+            "epoch": start_epoch,
+            **current_metrics,
+            "delta_psnr_from_fixed_x1": (
+                current_metrics["psnr_db"] - fixed_metrics["psnr_db"]
+            ),
+        }
+        if not validation_history:
+            validation_history.append(current_row)
+        elif int(validation_history[-1]["epoch"]) < start_epoch:
+            validation_history.append(current_row)
+        write_csv(validation_history_path, validation_history)
+        initial_metrics = {
+            name: float(validation_history[0][name]) for name in METRIC_NAMES
+        }
+
+        if args.resume and best_checkpoint_path.exists():
+            saved_best = torch.load(
+                best_checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            best_epoch = int(saved_best["selected_epoch"])
+            best_metrics = {
+                name: float(saved_best["metrics"][name]) for name in METRIC_NAMES
+            }
+            del saved_best
+            if current_metrics["psnr_db"] > best_metrics["psnr_db"]:
+                best_epoch = start_epoch
+                best_metrics = current_metrics
+                save_best_checkpoint(
+                    best_checkpoint_path,
+                    oracle,
+                    best_epoch,
+                    best_metrics,
+                )
+        else:
+            best_epoch = start_epoch
+            best_metrics = current_metrics
+            save_best_checkpoint(
+                best_checkpoint_path,
+                oracle,
+                best_epoch,
+                best_metrics,
+            )
+
+    def validate_epoch(completed_epoch: int) -> None:
+        nonlocal best_epoch, best_metrics
+        if not validation_seeds:
+            return
+        if (
+            completed_epoch % args.validation_every != 0
+            and completed_epoch != args.epochs
+        ):
+            return
+        _, _, metrics = evaluate(
+            oracle,
+            clean,
+            config,
+            canonical_matches,
+            validation_seeds,
+            args,
+            device,
+            image_dir,
+            include_fixed=False,
+            metrics_filename=f"validation_metrics_epoch_{completed_epoch}.csv",
+        )
+        row = {
+            "epoch": completed_epoch,
+            **metrics,
+            "delta_psnr_from_fixed_x1": (
+                metrics["psnr_db"] - fixed_metrics["psnr_db"]
+            ),
+        }
+        validation_history.append(row)
+        write_csv(validation_history_path, validation_history)
+        print(
+            f"    epoch {completed_epoch}: held-out={metrics['psnr_db']:.5f} dB, "
+            f"delta={row['delta_psnr_from_fixed_x1']:+.5f} dB",
+            flush=True,
+        )
+        if not best_metrics or metrics["psnr_db"] > best_metrics["psnr_db"]:
+            best_epoch = completed_epoch
+            best_metrics = metrics
+            save_best_checkpoint(
+                best_checkpoint_path,
+                oracle,
+                best_epoch,
+                best_metrics,
+            )
 
     history = train(
         oracle,
@@ -629,27 +916,62 @@ def process_image(
         image_dir,
         metadata,
         start_epoch,
+        validate_epoch,
     )
     save_checkpoint(checkpoint_path, oracle, optimizer, args.epochs, metadata)
-    _, fixed_metrics, learned_metrics = evaluate(
-        oracle,
-        clean,
-        config,
-        canonical_matches,
-        validation_seeds,
-        args,
-        device,
-        image_dir,
-    )
+    if validation_seeds:
+        saved_best = torch.load(
+            best_checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+        oracle.load_state_dict(saved_best["model"])
+        best_epoch = int(saved_best["selected_epoch"])
+        del saved_best
+        _, _, learned_metrics = evaluate(
+            oracle,
+            clean,
+            config,
+            canonical_matches,
+            validation_seeds,
+            args,
+            device,
+            image_dir,
+            include_fixed=False,
+            metrics_filename="best_validation_metrics.csv",
+            save_previews=True,
+        )
+        best_metrics = learned_metrics
+    else:
+        learned_metrics = {}
+        best_epoch = args.epochs
+
+    profile_file: str | None = None
+    dual_radial_statistics: dict[str, object] | None = None
+    if args.mode == "dual_radial":
+        if not isinstance(oracle, BM3DDualRadialOracle):
+            raise RuntimeError("dual_radial mode constructed the wrong oracle type")
+        log_profiles = (
+            oracle.radial_log_vectors().detach().cpu().numpy().astype(np.float32)
+        )
+        profile_file = "optimized_log_radial_profiles_float32.npy"
+        np.save(image_dir / profile_file, log_profiles)
+        dual_radial_statistics = profile_statistics(
+            log_profiles,
+            args.multiplier_min,
+            args.multiplier_max,
+        )
     final_model_path = image_dir / "optimized_model.pt"
     torch.save(
         {
             "format_version": 1,
-            "mode": oracle.mode,
+            "mode": args.mode,
             "model": {name: value.detach().cpu() for name, value in oracle.state_dict().items()},
             "metadata": metadata,
             "config": asdict(config),
             "train_seeds": train_seeds,
+            "validation_seeds": validation_seeds,
+            "selected_epoch": best_epoch,
         },
         final_model_path,
     )
@@ -662,25 +984,55 @@ def process_image(
         "validation_seeds": validation_seeds,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
+        "optimizer": args.optimizer,
         "learning_rate": args.learning_rate,
+        "validation_every": args.validation_every,
         "parameter_count": parameter_count,
+        "reference_count": reference_count,
+        "reference_grid_shape": reference_grid_shape,
         "optimizer_updates": len(history),
         "canonical_preparation_seconds": canonical_seconds,
         "total_seconds": perf_counter() - started,
         "canonical_group_counts": group_counts,
         "fixed_x1_validation_mean": fixed_metrics,
+        "initial_validation_mean": initial_metrics,
+        "selected_epoch": best_epoch,
         "learned_validation_mean": learned_metrics,
         "delta_psnr_db": (
             learned_metrics["psnr_db"] - fixed_metrics["psnr_db"]
             if learned_metrics
             else None
         ),
+        "parameterization": (
+            {
+                "parameters_per_reference": 16,
+                "h0_parameters": 8,
+                "h1_plus_parameters": 8,
+                "h1_plus_shared_across_hadamard_components": True,
+                "radial_expansion": (
+                    "Euclidean-radius interpolation in log-multiplier space"
+                ),
+            }
+            if args.mode == "dual_radial"
+            else {"mode": args.mode}
+        ),
+        "profile_statistics": dual_radial_statistics,
+        "validation_history": validation_history,
         "config": asdict(config),
         "files": {
             "model": final_model_path.name,
             "checkpoint": checkpoint_path.name,
             "history": "optimization_history.csv",
-            "validation": "validation_metrics.csv" if validation_seeds else None,
+            "best_checkpoint": (
+                best_checkpoint_path.name if validation_seeds else None
+            ),
+            "validation": (
+                "best_validation_metrics.csv" if validation_seeds else None
+            ),
+            "validation_history": (
+                validation_history_path.name if validation_seeds else None
+            ),
+            "radial_profiles": profile_file,
         },
     }
     write_json(summary_path, summary)
@@ -698,6 +1050,7 @@ def process_image(
 
 def main() -> int:
     args = parse_args()
+    resolve_optimization_defaults(args)
     validate_args(args)
     images = discover_images(args)
     if not images:
